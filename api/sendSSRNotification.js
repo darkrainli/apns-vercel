@@ -14,15 +14,29 @@ function sendJson(res, status, obj) {
 }
 
 /**
- * 用 HTTP/2 请求 APNs（Apple 要求 HTTP/2）
+ * 用 HTTP/2 请求 APNs（Apple 要求 HTTP/2），带超时避免挂死
  */
 function apnsRequestHttp2(apnsHost, path, bearerToken, topic, body) {
   return new Promise((resolve, reject) => {
+    const timeoutMs = 15000;
+    const timer = setTimeout(() => {
+      try { client.close(); } catch (_) {}
+      reject(new Error('APNs 请求超时'));
+    }, timeoutMs);
+
     let status = 0;
     let data = '';
+    let client;
+    try {
+      client = http2.connect(apnsHost);
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+      return;
+    }
 
-    const client = http2.connect(apnsHost);
     client.on('error', (err) => {
+      clearTimeout(timer);
       try { client.close(); } catch (_) {}
       reject(err);
     });
@@ -38,6 +52,7 @@ function apnsRequestHttp2(apnsHost, path, bearerToken, topic, body) {
     req.on('response', (headers) => { status = headers[':status'] || 0; });
     req.on('data', (chunk) => { data += chunk; });
     req.on('end', () => {
+      clearTimeout(timer);
       try { client.close(); } catch (_) {}
       let result = null;
       if (data) {
@@ -46,6 +61,7 @@ function apnsRequestHttp2(apnsHost, path, bearerToken, topic, body) {
       resolve({ status, result });
     });
     req.on('error', (err) => {
+      clearTimeout(timer);
       try { client.close(); } catch (_) {}
       reject(err);
     });
@@ -56,9 +72,9 @@ function apnsRequestHttp2(apnsHost, path, bearerToken, topic, body) {
 }
 
 /**
- * Vercel 入口函数（外层兜底，避免未捕获错误导致 FUNCTION_INVOCATION_FAILED）
+ * Vercel 入口：确保任何错误都返回 JSON，避免 FUNCTION_INVOCATION_FAILED
  */
-module.exports = async (req, res) => {
+async function main(req, res) {
   try {
     await handler(req, res);
   } catch (e) {
@@ -71,16 +87,26 @@ module.exports = async (req, res) => {
       }));
     } catch (_) {}
   }
-};
+}
+
+module.exports = main;
+// Vercel 部分环境可能认 default
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports.default = main;
+}
 
 async function handler(req, res) {
   try {
+    if (req.method === 'GET') {
+      sendJson(res, 200, { ok: true, message: 'sendSSRNotification 已就绪，请用 POST 发送 record' });
+      return;
+    }
     if (req.method !== 'POST') {
       sendJson(res, 405, { success: false, error: 'Method Not Allowed' });
       return;
     }
 
-    const data = req.body || {};
+    const data = req.body != null ? req.body : {};
     const payload = data.record || data;
     const { push_token: pushToken, user_id: userId, title, body } = payload || {};
 
