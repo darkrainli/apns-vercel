@@ -14,12 +14,18 @@ function sendJson(res, status, obj) {
 }
 
 /**
- * 用 HTTP/2 请求 APNs（Apple 要求 HTTP/2，fetch 会报协议错误）
+ * 用 HTTP/2 请求 APNs（Apple 要求 HTTP/2）
  */
 function apnsRequestHttp2(apnsHost, path, bearerToken, topic, body) {
   return new Promise((resolve, reject) => {
+    let status = 0;
+    let data = '';
+
     const client = http2.connect(apnsHost);
-    const bodyStr = JSON.stringify(body);
+    client.on('error', (err) => {
+      try { client.close(); } catch (_) {}
+      reject(err);
+    });
 
     const req = client.request({
       ':path': path,
@@ -29,38 +35,45 @@ function apnsRequestHttp2(apnsHost, path, bearerToken, topic, body) {
       'content-type': 'application/json',
     });
 
-    let data = '';
-    req.on('response', (headers) => {
-      const status = headers[':status'] || 0;
-      req.on('data', (chunk) => { data += chunk; });
-      req.on('end', () => {
-        client.close();
-        let result = null;
-        if (data) {
-          try {
-            result = JSON.parse(data);
-          } catch {
-            result = data;
-          }
-        }
-        resolve({ status, result });
-      });
+    req.on('response', (headers) => { status = headers[':status'] || 0; });
+    req.on('data', (chunk) => { data += chunk; });
+    req.on('end', () => {
+      try { client.close(); } catch (_) {}
+      let result = null;
+      if (data) {
+        try { result = JSON.parse(data); } catch { result = data; }
+      }
+      resolve({ status, result });
     });
-
     req.on('error', (err) => {
-      client.close();
+      try { client.close(); } catch (_) {}
       reject(err);
     });
 
-    req.write(bodyStr);
+    req.write(JSON.stringify(body));
     req.end();
   });
 }
 
 /**
- * Vercel 入口函数
+ * Vercel 入口函数（外层兜底，避免未捕获错误导致 FUNCTION_INVOCATION_FAILED）
  */
 module.exports = async (req, res) => {
+  try {
+    await handler(req, res);
+  } catch (e) {
+    try {
+      res.status(500).setHeader('Content-Type', 'application/json');
+      res.send(JSON.stringify({
+        success: false,
+        error: e && e.message ? e.message : String(e),
+        stack: e && e.stack ? e.stack : undefined,
+      }));
+    } catch (_) {}
+  }
+};
+
+async function handler(req, res) {
   try {
     if (req.method !== 'POST') {
       sendJson(res, 405, { success: false, error: 'Method Not Allowed' });
@@ -218,4 +231,4 @@ module.exports = async (req, res) => {
       detail,
     });
   }
-};
+}
