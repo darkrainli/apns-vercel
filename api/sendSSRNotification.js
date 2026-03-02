@@ -3,14 +3,19 @@
 // APNs 要求 HTTP/2，用 http2 模块代替 fetch
 const crypto = require('crypto');
 const http2 = require('http2');
-const jwt = require('jsonwebtoken');
+// jsonwebtoken 延迟加载，避免模块加载失败导致整函数 FUNCTION_INVOCATION_FAILED
 
 /**
- * 辅助：统一返回 JSON
+ * 辅助：统一返回 JSON（使用 res.json 兼容 Vercel）
  */
 function sendJson(res, status, obj) {
-  res.status(status).setHeader('Content-Type', 'application/json');
-  res.send(JSON.stringify(obj));
+  res.status(status);
+  if (typeof res.json === 'function') {
+    res.json(obj);
+  } else {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify(obj));
+  }
 }
 
 /**
@@ -79,12 +84,11 @@ async function main(req, res) {
     await handler(req, res);
   } catch (e) {
     try {
-      res.status(500).setHeader('Content-Type', 'application/json');
-      res.send(JSON.stringify({
+      sendJson(res, 500, {
         success: false,
         error: e && e.message ? e.message : String(e),
         stack: e && e.stack ? e.stack : undefined,
-      }));
+      });
     } catch (_) {}
   }
 }
@@ -202,7 +206,8 @@ async function handler(req, res) {
       return;
     }
 
-    // 4. 生成 APNs JWT
+    // 4. 生成 APNs JWT（延迟 require 避免加载阶段崩溃）
+    const jwt = require('jsonwebtoken');
     const apnsToken = jwt.sign(
       {},
       privateKeyObj,
@@ -220,7 +225,7 @@ async function handler(req, res) {
       ? 'https://api.push.apple.com'
       : 'https://api.development.push.apple.com';
     const path = `/3/device/${tokenToUse}`;
-    const payload = {
+    const apnsPayload = {
       aps: {
         alert: {
           title: title || '你有SSR活动卡待查收',
@@ -238,7 +243,7 @@ async function handler(req, res) {
       path,
     });
 
-    const { status, result } = await apnsRequestHttp2(apnsHost, path, apnsToken, APNS_BUNDLE_ID, payload);
+    const { status, result } = await apnsRequestHttp2(apnsHost, path, apnsToken, APNS_BUNDLE_ID, apnsPayload);
 
     console.log('[sendSSRNotification] APNs 响应', { status, result });
 
