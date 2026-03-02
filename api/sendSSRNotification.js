@@ -1,6 +1,8 @@
 // api/sendSSRNotification.js
 // Vercel Serverless Function: 处理 Memfire Webhook，查 push_token 并发 APNs
+// APNs 要求 HTTP/2，用 http2 模块代替 fetch
 const crypto = require('crypto');
+const http2 = require('http2');
 const jwt = require('jsonwebtoken');
 
 /**
@@ -9,6 +11,50 @@ const jwt = require('jsonwebtoken');
 function sendJson(res, status, obj) {
   res.status(status).setHeader('Content-Type', 'application/json');
   res.send(JSON.stringify(obj));
+}
+
+/**
+ * 用 HTTP/2 请求 APNs（Apple 要求 HTTP/2，fetch 会报协议错误）
+ */
+function apnsRequestHttp2(apnsHost, path, bearerToken, topic, body) {
+  return new Promise((resolve, reject) => {
+    const client = http2.connect(apnsHost);
+    const bodyStr = JSON.stringify(body);
+
+    const req = client.request({
+      ':path': path,
+      ':method': 'POST',
+      authorization: `Bearer ${bearerToken}`,
+      'apns-topic': topic,
+      'content-type': 'application/json',
+    });
+
+    let data = '';
+    req.on('response', (headers) => {
+      const status = headers[':status'] || 0;
+      req.on('data', (chunk) => { data += chunk; });
+      req.on('end', () => {
+        client.close();
+        let result = null;
+        if (data) {
+          try {
+            result = JSON.parse(data);
+          } catch {
+            result = data;
+          }
+        }
+        resolve({ status, result });
+      });
+    });
+
+    req.on('error', (err) => {
+      client.close();
+      reject(err);
+    });
+
+    req.write(bodyStr);
+    req.end();
+  });
 }
 
 /**
@@ -129,58 +175,37 @@ module.exports = async (req, res) => {
       }
     );
 
-    // 5. 调 APNs：开发环境用 sandbox，生产环境用正式环境
+    // 5. 调 APNs（HTTP/2）：开发用 sandbox，生产用正式
     const isProduction = process.env.APNS_PRODUCTION === 'true';
     const apnsHost = isProduction
       ? 'https://api.push.apple.com'
       : 'https://api.development.push.apple.com';
-    const apnsUrl = `${apnsHost}/3/device/${tokenToUse}`;
+    const path = `/3/device/${tokenToUse}`;
+    const payload = {
+      aps: {
+        alert: {
+          title: title || '你有SSR活动卡待查收',
+          body: body || '你的黑卡可兑换商家线下活动，点击查看',
+        },
+        sound: 'default',
+        badge: 1,
+        'content-available': 1,
+      },
+      type: 'ssr_invite',
+    };
 
     console.log('[sendSSRNotification] APNs 请求', {
       env: isProduction ? 'production' : 'development',
-      url: apnsUrl,
+      path,
     });
 
-    const response = await fetch(apnsUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apnsToken}`,
-        'apns-topic': APNS_BUNDLE_ID,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        aps: {
-          alert: {
-            title: title || '你有SSR活动卡待查收',
-            body: body || '你的黑卡可兑换商家线下活动，点击查看',
-          },
-          sound: 'default',
-          badge: 1,
-          'content-available': 1,
-        },
-        type: 'ssr_invite',
-      }),
-    });
+    const { status, result } = await apnsRequestHttp2(apnsHost, path, apnsToken, APNS_BUNDLE_ID, payload);
 
-    const resultText = await response.text();
-    let result = null;
-    if (resultText) {
-      try {
-        result = JSON.parse(resultText);
-      } catch {
-        result = resultText;
-      }
-    }
+    console.log('[sendSSRNotification] APNs 响应', { status, result });
 
-    console.log('[sendSSRNotification] APNs 响应', {
-      status: response.status,
-      ok: response.ok,
-      result,
-    });
-
-    sendJson(res, response.ok ? 200 : 500, {
-      success: response.ok,
-      status: response.status,
+    sendJson(res, status === 200 ? 200 : 500, {
+      success: status === 200,
+      status,
       result,
     });
   } catch (error) {
